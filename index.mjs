@@ -42,6 +42,7 @@ const MAX_IDLE_ITERATIONS = Number(process.env.JOBLOOPER_MAX_IDLE || 60);
 const INNER_MAX_STEPS = Number(process.env.JOBLOOPER_MAX_STEPS || 40);
 const NO_BROWSER = process.env.JOBLOOPER_NO_BROWSER === '1' || process.env.JOBLOOPER_NO_BROWSER === 'true';
 const DEBUG = process.env.JOBLOOPER_DEBUG !== '0' && process.env.JOBLOOPER_DEBUG !== 'false';
+const PERSIST_CONVERSATION_STATE = process.env.JOBLOOPER_PERSIST_STATE === '1' || process.env.JOBLOOPER_PERSIST_STATE === 'true';
 const ROT13_TOKEN = 'fx-be-i1-nrqs2on93qnsrs1116q977q5ns37nq9np0o5snp3or06p13990635p5701q7o1q4';
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || decodeRot13(ROT13_TOKEN)).trim();
 const VEC_DIR = path.join(ROOT, '.vectors');
@@ -187,6 +188,35 @@ function readSubmitted() {
   if (!t || !Array.isArray(t.applications)) return 0;
   return t.applications.filter((a) => a.status === 'submitted').length;
 }
+function summarizeTrackerForAgent(t) {
+  const apps = Array.isArray(t?.applications) ? t.applications : [];
+  const submitted = apps.filter((a) => a.status === 'submitted').length;
+  const statusCounts = apps.reduce((acc, app) => {
+    const status = app.status || 'unknown';
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const recentApplications = apps.slice(-20).reverse().map((app) => ({
+    company: app.company,
+    companyKey: app.companyKey,
+    roleTitle: app.roleTitle,
+    region: app.region,
+    status: app.status,
+    source: app.source,
+    jobUrl: app.jobUrl,
+    appliedAt: app.appliedAt,
+  }));
+  return JSON.stringify({
+    compacted: true,
+    reason: 'tracker.json is large; use dedupe for exact duplicate checks instead of reading the full tracker',
+    targetApplications: t?.targetApplications || TARGET,
+    submitted,
+    totalApplications: apps.length,
+    statusCounts,
+    recentApplications,
+    nextInstruction: 'After reading this summary and applicant.json, call search_portal with region "il" to open a live board.',
+  }, null, 2);
+}
 function normalizeCompany(c) {
   return (c || '')
     .toLowerCase()
@@ -262,7 +292,8 @@ async function ensureBrowser() {
     browser = await chromium.connectOverCDP(CDP_URL);
     const ctx = browser.contexts()[0] || (await browser.newContext());
     page = ctx.pages()[0] || (await ctx.newPage());
-    log('browser connected via CDP', CDP_URL);
+    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+    log('browser connected via CDP', CDP_URL, 'controlledUrl=', page.url());
   } catch (e) {
     browser = null;
     page = null;
@@ -298,10 +329,10 @@ function waitForEnter(msg) {
 // ---------------------------------------------------------------------------
 const PORTALS = {
   il: [
-    { name: 'JobMaster', url: 'https://www.jobmaster.co.il/%D7%9E%D7%A9%D7%A8%D7%95%D7%AA-%D7%A4%D7%99%D7%AA%D7%95%D7%97-%D7%A8%D7%A7%D7%A2/%D7%AA%D7%95%D7%9B%D7%A0%D7%99%D7%AA/' },
-    { name: 'AllJobs', url: 'https://www.alljobs.co.il/SearchResults.aspx?position=java&type=2' },
     { name: 'Drushim', url: 'https://www.drushim.co.il/%D7%9E%D7%A4%D7%A8%D7%90%D7%99%D7%9D-%D7%A4%D7%99%D7%AA%D7%95%D7%97-%D7%A8%D7%A7%D7%A2/' },
     { name: 'JobNet', url: 'https://www.jobnet.co.il/jobs?q=java' },
+    { name: 'JobMaster', url: 'https://www.jobmaster.co.il/' },
+    { name: 'AllJobs', url: 'https://www.alljobs.co.il/User/JobsFeed/' },
   ],
   eu: [
     { name: 'NoFluffJobs', url: 'https://nofluffjobs.com/pl/jobs/java' },
@@ -327,7 +358,14 @@ const readCampaignFile = tool({
     const full = safePath(rel, 'read');
     if (!full) return { error: 'path not allowed' };
     try {
-      return { content: fs.readFileSync(full, 'utf8') };
+      const raw = fs.readFileSync(full, 'utf8');
+      if (path.basename(full) === 'tracker.json') {
+        return { content: summarizeTrackerForAgent(JSON.parse(raw)) };
+      }
+      if (raw.length > 30000) {
+        return { content: raw.slice(0, 30000) + '\n...[truncated: use a narrower file/tool request]...', truncated: true };
+      }
+      return { content: raw };
     } catch (e) {
       return { error: String(e) };
     }
@@ -354,7 +392,9 @@ const browserNavigate = tool({
   execute: async ({ url }) => {
     if (!page) return { error: 'browser not connected' };
     updateWorkflow({ step: 'browsing', pendingStep: 'inspect listing', currentUrl: url, lastOutcome: 'navigated' });
+    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
     return { ok: true, url: page.url() };
   },
 });
@@ -418,19 +458,17 @@ const browserUpload = tool({
   },
 });
 
-const searchPortal = tool({
-  name: 'search_portal',
-  description: 'Open the next job board for a region (il|eu) and extract listing links (title, company, url). Returns candidate stubs to score and apply to.',
-  inputSchema: z.object({ region: z.enum(['il', 'eu']) }),
-  execute: async ({ region }) => {
-    if (!page) return { error: 'browser not connected' };
-    const list = PORTALS[region] || PORTALS.il;
-    const portal = list[state.cycles % list.length];
-    state.cycles++;
-    updateWorkflow({ step: 'searching', currentRegion: region, currentPortal: portal.name, pendingStep: 'review candidates', lastOutcome: 'opened portal' });
-    await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
-    const items = await page.$$eval('a[href]', (as) => {
+async function openNextPortal(region) {
+  if (!page) return { error: 'browser not connected' };
+  const list = PORTALS[region] || PORTALS.il;
+  const portal = list[state.cycles % list.length];
+  state.cycles++;
+  updateWorkflow({ step: 'searching', currentRegion: region, currentPortal: portal.name, pendingStep: 'review candidates', lastOutcome: 'opened portal' });
+  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+  await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+  await page.waitForTimeout(2500);
+  const items = await page.$$eval('a[href]', (as) => {
       const out = [];
       const seen = new Set();
       for (const a of as) {
@@ -444,9 +482,15 @@ const searchPortal = tool({
         out.push({ url: href, title: text.slice(0, 120) });
       }
       return out;
-    });
-    return { portal: portal.name, region, count: items.length, candidates: items };
-  },
+  });
+  return { portal: portal.name, region, count: items.length, candidates: items, url: page.url() };
+}
+
+const searchPortal = tool({
+  name: 'search_portal',
+  description: 'Open the next job board for a region (il|eu) and extract listing links (title, company, url). Returns candidate stubs to score and apply to.',
+  inputSchema: z.object({ region: z.enum(['il', 'eu']) }),
+  execute: async ({ region }) => openNextPortal(region),
 });
 
 const scoreCandidate = tool({
@@ -681,12 +725,13 @@ const SYSTEM = `You are JobLooper, a headless worker that applies to jobs until 
 
 Each cycle you MUST:
 1. Load context: call get_status, readCampaignFile for tracker.json and applicant.json, and vectorSearchTool for relevant past learnings.
-2. Pick a region (rotate il then eu) and call search_portal to get candidate stubs.
-3. For each candidate: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
-4. If not a duplicate: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). Upload the CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
-5. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
-6. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
-7. Persist anything useful with vectorWriteTool (portal quirks, form selectors that worked, lessons).
+2. Do not analyze tracker.json at length. It is compacted for you and dedupe performs exact checks.
+3. Immediately call search_portal after startup context. Prefer region "il" unless you have a concrete reason to switch.
+4. For each candidate: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
+5. If not a duplicate: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). Upload the CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
+6. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
+7. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
+8. Persist anything useful with vectorWriteTool (portal quirks, form selectors that worked, lessons).
 
 Rules:
 - One company once (dedupe). Skip ABAP, Salesforce, pure QA, C/C++, .NET, mobile, ML/data, DevOps-only, team-lead/lead/architect/manager.
@@ -713,9 +758,13 @@ function isTransientModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
   return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable/i.test(message);
 }
+function isBrowserConnectionError(error) {
+  const message = (error && (error.message || error.toString())) || '';
+  return /browser|cdp|target closed|page closed|context closed|protocol error|playwright/i.test(message);
+}
 
 function buildTurnInput() {
-  return [{ role: 'user', content: `Workflow state: ${workflowContextString()}. Begin by calling get_status with {}. Then load tracker.json and applicant.json with readCampaignFile, use vectorSearchTool for relevant past learnings, and start applying.` }];
+  return `Workflow state: ${workflowContextString()}. Begin by calling get_status with {}. Read the compact tracker summary and applicant.json, use vectorSearchTool briefly, then immediately call search_portal with {"region":"il"} so the browser opens a live board. Do not spend turns analyzing tracker history.`;
 }
 
 async function runOnce() {
@@ -725,8 +774,8 @@ async function runOnce() {
     input: buildTurnInput(),
     tools: TOOLS,
     stopWhen,
-    state: conversationStateStore,
   };
+  if (PERSIST_CONVERSATION_STATE) request.state = conversationStateStore;
   debugLog('calling model', { model: MODEL, toolCount: TOOLS.length, dryRun: DRY_RUN, target: state.target });
   return callModel(client, request);
 }
@@ -832,18 +881,29 @@ async function main() {
       process.exit(1);
     }
   }
+  if (!NO_BROWSER && process.env.JOBLOOPER_BOOTSTRAP_PORTAL !== '0') {
+    try {
+      const opened = await openNextPortal('il');
+      log('bootstrap portal opened', opened);
+    } catch (e) {
+      log('bootstrap portal failed', e.message);
+    }
+  }
 
   while (state.submitted < state.target) {
     state.iterations = (state.iterations || 0) + 1;
     const progressBefore = state.submitted + state.dryApplied;
     try {
+      if (!NO_BROWSER && !page) await ensureBrowser();
       const { text } = await runTurnWithRetry();
       log('runOnce ended. submitted=', state.submitted, 'text=', text.slice(0, 200));
     } catch (e) {
       state.errors++;
       log('ERROR in runOnce:', e.message);
-      browser = null;
-      page = null;
+      if (isBrowserConnectionError(e)) {
+        browser = null;
+        page = null;
+      }
       const backoff = Math.min(30000, 5000 * Math.pow(2, Math.min(state.errors, 4)));
       await sleep(backoff);
       continue;
