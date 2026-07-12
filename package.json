@@ -1,0 +1,20 @@
+{
+  "name": "joblooper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless OpenRouter-agent job-application looper (single file, no frontend)",
+  "scripts": {
+    "login": "node index.mjs login",
+    "start": "node index.mjs run",
+    "dry": "node index.mjs dry"
+  },
+  "dependencies": {
+    "@openrouter/agent": "^0.7.2",
+    "@openrouter/sdk": "^0.13.43",
+    "dotenv": "^16.4.5",
+    "playwright-core": "^1.61.1",
+    "vectra": "^0.12.3",
+    "zod": "^4.0.0"
+  }
+}
