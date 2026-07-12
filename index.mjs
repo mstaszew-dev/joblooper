@@ -21,12 +21,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
 // ---------------------------------------------------------------------------
 // Config (from .env)
 // ---------------------------------------------------------------------------
-const ROOT = process.cwd();
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = SCRIPT_DIR;
 const CAMPAIGN_DIR = process.env.CAMPAIGN_DIR || '/Users/mst/Downloads/job-search/job-apply';
 const CHROME_PROFILE = process.env.CHROME_PROFILE || path.join(os.homedir(), '.playwright-chrome');
 const CDP_URL = process.env.CDP_URL || 'http://127.0.0.1:9222';
@@ -39,6 +41,7 @@ const MAX_ITERATIONS = Number(process.env.JOBLOOPER_MAX_ITERATIONS || 500);
 const MAX_IDLE_ITERATIONS = Number(process.env.JOBLOOPER_MAX_IDLE || 60);
 const INNER_MAX_STEPS = Number(process.env.JOBLOOPER_MAX_STEPS || 40);
 const NO_BROWSER = process.env.JOBLOOPER_NO_BROWSER === '1' || process.env.JOBLOOPER_NO_BROWSER === 'true';
+const DEBUG = process.env.JOBLOOPER_DEBUG !== '0' && process.env.JOBLOOPER_DEBUG !== 'false';
 const ROT13_TOKEN = 'fx-be-i1-nrqs2on93qnsrs1116q977q5ns37nq9np0o5snp3or06p13990635p5701q7o1q4';
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || decodeRot13(ROT13_TOKEN)).trim();
 const VEC_DIR = path.join(ROOT, '.vectors');
@@ -66,11 +69,107 @@ function log(...args) {
     /* ignore */
   }
 }
+function debugLog(...args) {
+  if (!DEBUG) return;
+  log('[debug]', ...args);
+}
 
 // ---------------------------------------------------------------------------
 // Campaign state (read fresh from disk each call so the agent never drifts)
 // ---------------------------------------------------------------------------
-const state = { submitted: 0, target: TARGET, errors: 0, cycles: 0, dryApplied: 0 };
+const state = {
+  submitted: 0,
+  target: TARGET,
+  errors: 0,
+  cycles: 0,
+  dryApplied: 0,
+  workflow: {
+    step: 'idle',
+    currentRegion: null,
+    currentPortal: null,
+    currentCandidate: null,
+    pendingStep: null,
+    lastOutcome: null,
+    updatedAt: null,
+  },
+};
+
+function updateWorkflow(patch = {}) {
+  state.workflow = {
+    ...state.workflow,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  return state.workflow;
+}
+
+function workflowContextString() {
+  return JSON.stringify(state.workflow);
+}
+
+function extractMessageText(item) {
+  if (typeof item === 'string') return item;
+  if (item && typeof item === 'object') {
+    if (typeof item.content === 'string') return item.content;
+    if (Array.isArray(item.content)) {
+      return item.content.map((part) => (typeof part === 'string' ? part : JSON.stringify(part))).join('\n');
+    }
+    if (typeof item.text === 'string') return item.text;
+  }
+  return JSON.stringify(item);
+}
+
+function compactConversationState(currentState, { maxMessages = 18, maxChars = 18000 } = {}) {
+  const messages = Array.isArray(currentState?.messages) ? currentState.messages : [];
+  if (messages.length <= maxMessages) {
+    const serialized = JSON.stringify(messages).length;
+    if (serialized <= maxChars) return { ...currentState, messages };
+  }
+  const keep = Math.max(1, maxMessages - 1);
+  const kept = messages.slice(-keep);
+  const dropped = messages.slice(0, -keep);
+  const summaryText = dropped.map(extractMessageText).filter(Boolean).join('\n').slice(0, 1800);
+  const summaryMessage = { role: 'system', content: `[conversation summary] Earlier turns were compacted. ${summaryText || 'No earlier details available.'}` };
+  const compactedMessages = [
+    ...(kept[0] && kept[0].role === 'system' && String(kept[0].content || '').includes('[conversation summary]') ? [] : [summaryMessage]),
+    ...kept,
+  ];
+  return {
+    ...currentState,
+    messages: compactedMessages,
+    workflow: currentState?.workflow || state.workflow,
+  };
+}
+
+function createConversationStateStore(filePath) {
+  return {
+    async load() {
+      try {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        return compactConversationState(parsed);
+      } catch (error) {
+        if (error && error.code !== 'ENOENT') debugLog('state load failed', error.message);
+        return null;
+      }
+    },
+    async save(nextState) {
+      const persistedState = compactConversationState({
+        ...nextState,
+        workflow: {
+          ...(nextState?.workflow || state.workflow),
+          ...state.workflow,
+          updatedAt: new Date().toISOString(),
+        },
+      });
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(persistedState, null, 2));
+    },
+  };
+}
+
+export { compactConversationState, createConversationStateStore };
 
 function loadTracker() {
   try {
@@ -254,6 +353,7 @@ const browserNavigate = tool({
   inputSchema: z.object({ url: z.string() }),
   execute: async ({ url }) => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'browsing', pendingStep: 'inspect listing', currentUrl: url, lastOutcome: 'navigated' });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     return { ok: true, url: page.url() };
   },
@@ -327,6 +427,7 @@ const searchPortal = tool({
     const list = PORTALS[region] || PORTALS.il;
     const portal = list[state.cycles % list.length];
     state.cycles++;
+    updateWorkflow({ step: 'searching', currentRegion: region, currentPortal: portal.name, pendingStep: 'review candidates', lastOutcome: 'opened portal' });
     await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2500);
     const items = await page.$$eval('a[href]', (as) => {
@@ -360,17 +461,37 @@ const scoreCandidate = tool({
   }),
   execute: async ({ roleTitle, description, region, remotePolicy, salarySeen }) => {
     const text = (roleTitle + ' ' + description).toLowerCase();
-    if (SKIP_ROLE.test(text)) return { decision: 'skip', reason: 'excluded role/level' };
-    if (!ALLOW_ROLE.test(text)) return { decision: 'skip', reason: 'no matching stack' };
-    if (region === 'eu' || region === 'global') {
-      if (!/remote/i.test(remotePolicy) && !/remote/i.test(text)) return { decision: 'skip', reason: 'EU must be full remote' };
-      const m = salarySeen && salarySeen.match(/(\d[\d,]*)\s*(pln|zł|zl)/i);
-      if (m) {
-        const num = Number(m[1].replace(/,/g, ''));
-        if (num > 0 && num < 15000) return { decision: 'skip', reason: 'EU B2B below 15k PLN' };
+    let decision;
+    if (SKIP_ROLE.test(text)) {
+      decision = { decision: 'skip', reason: 'excluded role/level' };
+    } else if (!ALLOW_ROLE.test(text)) {
+      decision = { decision: 'skip', reason: 'no matching stack' };
+    } else if (region === 'eu' || region === 'global') {
+      if (!/remote/i.test(remotePolicy) && !/remote/i.test(text)) {
+        decision = { decision: 'skip', reason: 'EU must be full remote' };
+      } else {
+        const m = salarySeen && salarySeen.match(/(\d[\d,]*)\s*(pln|zł|zl)/i);
+        if (m) {
+          const num = Number(m[1].replace(/,/g, ''));
+          if (num > 0 && num < 15000) {
+            decision = { decision: 'skip', reason: 'EU B2B below 15k PLN' };
+          } else {
+            decision = { decision: 'apply', reason: 'matches stack and policy' };
+          }
+        } else {
+          decision = { decision: 'apply', reason: 'matches stack and policy' };
+        }
       }
+    } else {
+      decision = { decision: 'apply', reason: 'matches stack and policy' };
     }
-    return { decision: 'apply', reason: 'matches stack and policy' };
+    updateWorkflow({
+      step: decision.decision === 'apply' ? 'scoring' : 'skipped',
+      pendingStep: decision.decision === 'apply' ? 'prepare application' : 'record skip',
+      currentCandidate: { roleTitle, region },
+      lastOutcome: decision.decision,
+    });
+    return decision;
   },
 });
 
@@ -385,6 +506,7 @@ const dedupe = tool({
   }),
   execute: async ({ company, roleTitle, id, url }) => {
     const t = loadTracker();
+    updateWorkflow({ step: 'deduping', pendingStep: 'confirm candidate', currentCandidate: { company, roleTitle, id, url }, lastOutcome: 'checked duplicate status' });
     const apps = (t && t.applications) || [];
     const ck = normalizeCompany(company);
     const candId = id || '';
@@ -425,6 +547,12 @@ const recordSubmission = tool({
   }),
   execute: async (c) => {
     const ck = normalizeCompany(c.company);
+    updateWorkflow({
+      step: 'submitted',
+      pendingStep: 'done',
+      currentCandidate: { company: c.company, roleTitle: c.roleTitle, url: c.url, region: c.region },
+      lastOutcome: 'submitted',
+    });
     if (DRY_RUN) {
       state.dryApplied++;
       log('[DRY-RUN] would record submission:', c.company, c.roleTitle, 'dryApplied=', state.dryApplied);
@@ -465,6 +593,7 @@ const recordSkip = tool({
     reason: z.enum(['skippedDuplicate', 'skippedSalary', 'skippedFilter']),
   }),
   execute: async ({ company, reason }) => {
+    updateWorkflow({ step: 'skipped', pendingStep: 'record skip', currentCandidate: { company }, lastOutcome: reason });
     if (DRY_RUN) {
       log('[DRY-RUN] skip', reason, company);
       return { ok: true, dryRun: true };
@@ -477,11 +606,18 @@ const recordSkip = tool({
   },
 });
 
+const getStatusAlias = tool({
+  name: 'forget_status',
+  description: 'Alias for get_status. Use only if the model accidentally calls this typo; it returns the same progress payload.',
+  inputSchema: z.object({}).passthrough(),
+  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, workflow: state.workflow }),
+});
+
 const getStatus = tool({
   name: 'get_status',
   description: 'Return current progress: submitted, target, dryRun, errors, cycles.',
   inputSchema: z.object({}),
-  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles }),
+  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, workflow: state.workflow }),
 });
 
 const vectorWriteTool = tool({
@@ -531,6 +667,7 @@ const TOOLS = [
   dedupe,
   recordSubmission,
   recordSkip,
+  getStatusAlias,
   getStatus,
   vectorWriteTool,
   vectorSearchTool,
@@ -556,12 +693,14 @@ Rules:
 - IL: remote, hybrid, or onsite all OK. EU/global: full remote only, B2B >= 15000 PLN/month when salary is listed.
 - Use only the single browser tab; navigate on it. Do not open extra tabs.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
-- Keep applying until get_status shows submitted >= target.`;
+- Keep applying until get_status shows submitted >= target.
+- Use only the exact tool names provided to you. Do not invent tools such as forget_status or any other typo. Start every turn with get_status with an empty object.`;
 
 // ---------------------------------------------------------------------------
 // Agent loop
 // ---------------------------------------------------------------------------
 const client = new OpenRouterCore({ apiKey: OPENROUTER_API_KEY });
+const conversationStateStore = createConversationStateStore(path.join(ROOT, '.conversation-state.json'));
 
 function stopWhen({ steps }) {
   if (state.submitted >= state.target) return true;
@@ -570,21 +709,105 @@ function stopWhen({ steps }) {
   return false; // keep the loop alive
 }
 
+function isTransientModelError(error) {
+  const message = (error && (error.message || error.toString())) || '';
+  return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable/i.test(message);
+}
+
+function buildTurnInput() {
+  return [{ role: 'user', content: `Workflow state: ${workflowContextString()}. Begin by calling get_status with {}. Then load tracker.json and applicant.json with readCampaignFile, use vectorSearchTool for relevant past learnings, and start applying.` }];
+}
+
 async function runOnce() {
-  return callModel(client, {
+  const request = {
     model: MODEL,
     instructions: SYSTEM,
-    input: 'Begin. Load current campaign context via tools, then start applying. Use vectorSearchTool for relevant past learnings and vectorWriteTool to persist new ones.',
+    input: buildTurnInput(),
     tools: TOOLS,
     stopWhen,
+    state: conversationStateStore,
+  };
+  debugLog('calling model', { model: MODEL, toolCount: TOOLS.length, dryRun: DRY_RUN, target: state.target });
+  return callModel(client, request);
+}
+
+async function debugModelTurn(result) {
+  const toolCallSummaries = [];
+  try {
+    for await (const event of result.getFullResponsesStream()) {
+      const summary = event && typeof event === 'object'
+        ? {
+            type: event.type,
+            itemType: event.item?.type,
+            name: event.name || event.item?.name,
+            toolCallId: event.call_id || event.toolCallId,
+            status: event.status,
+            responseId: event.response?.id,
+            delta: typeof event.delta === 'string' ? event.delta.slice(0, 200) : undefined,
+          }
+        : String(event);
+      debugLog('model event', summary);
+    }
+  } catch (e) {
+    debugLog('model event stream failed', e.message);
+    throw e;
+  }
+
+  let text;
+  try {
+    text = await result.getText();
+  } catch (e) {
+    debugLog('getText failed', e.message);
+    throw e;
+  }
+  let toolCalls;
+  try {
+    toolCalls = await result.getToolCalls();
+  } catch (e) {
+    debugLog('getToolCalls failed', e.message);
+    throw e;
+  }
+  for (const call of toolCalls || []) {
+    toolCallSummaries.push({ name: call.name, arguments: call.arguments });
+  }
+  const textPreview = (text || '').slice(0, 400);
+  debugLog('model turn complete', {
+    textPreview,
+    toolCalls: toolCallSummaries,
+    submitted: state.submitted,
+    dryApplied: state.dryApplied,
   });
+  return { text, toolCalls };
+}
+
+async function runTurnWithRetry() {
+  const maxAttempts = 5;
+  let delayMs = 2000;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await runOnce();
+      return await debugModelTurn(result);
+    } catch (e) {
+      lastError = e;
+      if (!isTransientModelError(e) || attempt >= maxAttempts) {
+        throw e;
+      }
+      log(`model turn attempt ${attempt}/${maxAttempts} failed, retrying in ${delayMs}ms`, e.message);
+      await sleep(delayMs);
+      delayMs = Math.min(delayMs * 2, 30000);
+    }
+  }
+
+  throw lastError;
 }
 
 async function main() {
   const mode = process.argv[2] || 'run';
   await ensureVec();
   state.submitted = readSubmitted();
-  log('JobLooper start. mode=', mode, 'submitted=', state.submitted, '/', state.target, 'dryRun=', DRY_RUN, 'model=', MODEL);
+  log('JobLooper start. mode=', mode, 'submitted=', state.submitted, '/', state.target, 'dryRun=', DRY_RUN, 'model=', MODEL, 'debug=', DEBUG, 'apiKeyConfigured=', Boolean(OPENROUTER_API_KEY));
 
   if (mode === 'login') {
     launchChromeForLogin();
@@ -614,8 +837,7 @@ async function main() {
     state.iterations = (state.iterations || 0) + 1;
     const progressBefore = state.submitted + state.dryApplied;
     try {
-      const result = await runOnce();
-      const text = await result.getText().catch(() => '');
+      const { text } = await runTurnWithRetry();
       log('runOnce ended. submitted=', state.submitted, 'text=', text.slice(0, 200));
     } catch (e) {
       state.errors++;
@@ -650,7 +872,9 @@ async function main() {
   log('STOPPED. submitted=', state.submitted, '/', state.target);
 }
 
-main().catch((e) => {
-  log('FATAL', e.message);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  main().catch((e) => {
+    log('FATAL', e && e.stack ? e.stack : e.message);
+    process.exit(1);
+  });
+}
