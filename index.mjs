@@ -819,6 +819,7 @@ async function debugModelTurn(result) {
   for (const call of toolCalls || []) {
     toolCallSummaries.push({ name: call.name, arguments: call.arguments });
   }
+  await recoverMalformedToolCalls(toolCallSummaries);
   const textPreview = (text || '').slice(0, 400);
   debugLog('model turn complete', {
     textPreview,
@@ -827,6 +828,15 @@ async function debugModelTurn(result) {
     dryApplied: state.dryApplied,
   });
   return { text, toolCalls };
+}
+
+async function recoverMalformedToolCalls(toolCalls) {
+  const malformedSearch = toolCalls.find((call) => call.name && call.name !== 'search_portal' && String(call.name).includes('search_portal'));
+  if (!malformedSearch) return;
+  if (!page && !NO_BROWSER) await ensureBrowser();
+  const region = malformedSearch.arguments?.region === 'eu' ? 'eu' : 'il';
+  const opened = await openNextPortal(region);
+  log('[tool-recovery] opened portal for malformed tool call', malformedSearch.name, opened);
 }
 
 async function runTurnWithRetry() {
