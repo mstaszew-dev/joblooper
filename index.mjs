@@ -42,7 +42,7 @@ const MAX_IDLE_ITERATIONS = Number(process.env.JOBLOOPER_MAX_IDLE || 60);
 const INNER_MAX_STEPS = Number(process.env.JOBLOOPER_MAX_STEPS || 40);
 const NO_BROWSER = process.env.JOBLOOPER_NO_BROWSER === '1' || process.env.JOBLOOPER_NO_BROWSER === 'true';
 const DEBUG = process.env.JOBLOOPER_DEBUG !== '0' && process.env.JOBLOOPER_DEBUG !== 'false';
-const PERSIST_CONVERSATION_STATE = process.env.JOBLOOPER_PERSIST_STATE === '1' || process.env.JOBLOOPER_PERSIST_STATE === 'true';
+const PERSIST_CONVERSATION_STATE = process.env.JOBLOOPER_PERSIST_STATE !== '0' && process.env.JOBLOOPER_PERSIST_STATE !== 'false';
 const ROT13_TOKEN = 'fx-be-i1-nrqs2on93qnsrs1116q977q5ns37nq9np0o5snp3or06p13990635p5701q7o1q4';
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || decodeRot13(ROT13_TOKEN)).trim();
 const VEC_DIR = path.join(ROOT, '.vectors');
@@ -84,6 +84,7 @@ const state = {
   errors: 0,
   cycles: 0,
   dryApplied: 0,
+  activity: 0,
   workflow: {
     step: 'idle',
     currentRegion: null,
@@ -96,6 +97,7 @@ const state = {
 };
 
 function updateWorkflow(patch = {}) {
+  state.activity++;
   state.workflow = {
     ...state.workflow,
     ...patch,
@@ -483,6 +485,7 @@ const browserSnapshot = tool({
   inputSchema: z.object({}),
   execute: async () => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'inspecting', pendingStep: 'read page', currentUrl: page.url(), lastOutcome: 'snapshot' });
     const snap = await page.accessibility.snapshot();
     const text = JSON.stringify(snap);
     return { snapshot: text.length > 8000 ? text.slice(0, 8000) + '...[truncated]' : text };
@@ -495,6 +498,7 @@ const browserEvaluate = tool({
   inputSchema: z.object({ expression: z.string() }),
   execute: async ({ expression }) => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'inspecting', pendingStep: 'evaluate page', currentUrl: page.url(), lastOutcome: 'evaluated' });
     const r = await page.evaluate((expr) => {
       const f = new Function('return (' + expr + ')');
       return f();
@@ -509,6 +513,7 @@ const browserClick = tool({
   inputSchema: z.object({ selector: z.string() }),
   execute: async ({ selector }) => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'browsing', pendingStep: 'inspect result', currentUrl: page.url(), lastOutcome: 'clicked' });
     await page.click(selector, { timeout: 15000 });
     return { ok: true };
   },
@@ -520,6 +525,7 @@ const browserFill = tool({
   inputSchema: z.object({ selector: z.string(), value: z.string() }),
   execute: async ({ selector, value }) => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'applying', pendingStep: 'fill application', currentUrl: page.url(), lastOutcome: 'filled field' });
     await page.fill(selector, value, { timeout: 15000 });
     return { ok: true };
   },
@@ -531,6 +537,7 @@ const browserUpload = tool({
   inputSchema: z.object({ selector: z.string(), filePath: z.string() }),
   execute: async ({ selector, filePath }) => {
     if (!page) return { error: 'browser not connected' };
+    updateWorkflow({ step: 'applying', pendingStep: 'upload cv', currentUrl: page.url(), lastOutcome: 'uploaded file' });
     await page.setInputFiles(selector, filePath);
     return { ok: true };
   },
@@ -708,14 +715,14 @@ const getStatusAlias = tool({
   name: 'forget_status',
   description: 'Alias for get_status. Use only if the model accidentally calls this typo; it returns the same progress payload.',
   inputSchema: z.object({}).passthrough(),
-  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, workflow: state.workflow }),
+  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, activity: state.activity, workflow: state.workflow }),
 });
 
 const getStatus = tool({
   name: 'get_status',
   description: 'Return current progress: submitted, target, dryRun, errors, cycles.',
   inputSchema: z.object({}),
-  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, workflow: state.workflow }),
+  execute: async () => ({ submitted: state.submitted, target: state.target, dryRun: DRY_RUN, errors: state.errors, cycles: state.cycles, activity: state.activity, workflow: state.workflow }),
 });
 
 const vectorWriteTool = tool({
@@ -840,7 +847,7 @@ async function runOnce() {
     stopWhen,
   };
   if (PERSIST_CONVERSATION_STATE) request.state = conversationStateStore;
-  debugLog('calling model', { model: MODEL, toolCount: TOOLS.length, dryRun: DRY_RUN, target: state.target });
+  debugLog('calling model', { model: MODEL, toolCount: TOOLS.length, dryRun: DRY_RUN, target: state.target, persistState: PERSIST_CONVERSATION_STATE });
   return callModel(client, request);
 }
 
@@ -980,7 +987,7 @@ async function main() {
 
   while (state.submitted < state.target) {
     state.iterations = (state.iterations || 0) + 1;
-    const progressBefore = state.submitted + state.dryApplied;
+    const progressBefore = state.submitted + state.dryApplied + state.activity;
     try {
       if (!NO_BROWSER && !page) await ensureBrowser();
       const { text } = await runTurnWithRetry();
@@ -1003,14 +1010,14 @@ async function main() {
       log('test max applies reached');
       break;
     }
-    const progressAfter = state.submitted + state.dryApplied;
+    const progressAfter = state.submitted + state.dryApplied + state.activity;
     state.idle = progressAfter === progressBefore ? (state.idle || 0) + 1 : 0;
     if (state.iterations > MAX_ITERATIONS) {
       log('MAX_ITERATIONS', MAX_ITERATIONS, 'reached; stopping');
       break;
     }
     if (state.idle > MAX_IDLE_ITERATIONS) {
-      log('no progress for', state.idle, 'iterations; stopping to avoid an endless loop');
+      log('no workflow activity for', state.idle, 'iterations; stopping to avoid an endless loop');
       break;
     }
     // Opt-in human review checkpoint after an iteration that submitted something.
