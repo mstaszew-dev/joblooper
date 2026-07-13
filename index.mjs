@@ -338,11 +338,13 @@ const PORTALS = {
     { name: 'JobNet', url: 'https://www.jobnet.co.il/jobs?q=java' },
     { name: 'JobMaster', url: 'https://www.jobmaster.co.il/' },
     { name: 'AllJobs', url: 'https://www.alljobs.co.il/User/JobsFeed/' },
+    { name: 'Google IL Jobs', url: 'https://www.google.com/search?q=site%3Ail+%28java+OR+backend+OR+fullstack%29+developer+jobs+Israel+Petah+Tikva' },
   ],
   eu: [
     { name: 'NoFluffJobs', url: 'https://nofluffjobs.com/pl/jobs/java' },
     { name: 'JustJoinIT', url: 'https://justjoin.it/all/location/remote' },
     { name: 'Pracuj', url: 'https://www.pracuj.pl/praca/java%20developer' },
+    { name: 'Google EU Jobs', url: 'https://www.google.com/search?q=remote+java+backend+fullstack+developer+jobs+Poland+B2B' },
   ],
 };
 const PORTAL_REUSE_HOSTS = new Set(Object.values(PORTALS).flat().map((portal) => {
@@ -791,7 +793,7 @@ const SYSTEM = `You are JobLooper, a headless worker that applies to jobs until 
 Each cycle you MUST:
 1. Load context: call get_status, readCampaignFile for tracker.json and applicant.json, and vectorSearchTool for relevant past learnings/campaign context.
 2. Do not analyze tracker.json at length. It is compacted for you and dedupe performs exact checks.
-3. Immediately call search_portal after startup context. Prefer the configured portal list and region "il" unless you have a concrete reason to switch.
+3. Immediately call search_portal after startup context. Prefer the configured portal list and region "il" unless you have a concrete reason to switch. Google discovery results, other reputable portals, and company career pages are valid sources too when they lead to real listings.
 4. For each candidate: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
 5. If all checks are green: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). For IL/Petah Tikva roles, upload the current Petah Tikva CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
 6. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
@@ -801,6 +803,7 @@ Each cycle you MUST:
 Rules:
 - One company once (dedupe). Skip ABAP, Salesforce, pure QA, C/C++, .NET, mobile, ML/data, DevOps-only, team-lead/lead/architect/manager.
 - IL: remote, hybrid, or onsite all OK. EU/global: full remote only, B2B >= 15000 PLN/month when salary is listed.
+- Jobs may come from the configured portals, Google search results, another job board, or a company career page. Apply the same score, dedupe, browser verification, and record gates for every source.
 - Reuse already-open portal tabs. Do not open duplicate tabs for the same site.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
 - Keep applying until get_status shows submitted >= target.
