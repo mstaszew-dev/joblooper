@@ -421,17 +421,11 @@ async function navigateControlledPage(url, { waitMs = 0 } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// CV-alignment policy (kept in sync with the campaign rules)
-// ---------------------------------------------------------------------------
-const SKIP_ROLE = /(abap|salesforce|apex|\bqa\b|quality assurance|automation tester|c\+\+|\.net|asp\.net|c#|mobile|android|ios|ml|machine learning|data scientist|devops|sre|site reliability|team lead|tech lead|technical lead|lead developer|lead engineer|principal|staff|architect|manager|director|head|vp)/i;
-const ALLOW_ROLE = /(java|kotlin|spring|php|laravel|symfony|node|nest|react|angular|backend|full.?stack|fullstack|engineer|developer)/i;
-
-// ---------------------------------------------------------------------------
 // Tools (the "MCP tool set" the agent calls)
 // ---------------------------------------------------------------------------
 const readCampaignFile = tool({
   name: 'readCampaignFile',
-  description: 'Read a campaign file: tracker.json, applicant.json, PORTALS.md, AGENT_TICK.md, or any notes file. Returns text content.',
+  description: 'Read a text file from the campaign workspace or repo workspace. Large tracker files may be returned as a compact summary.',
   inputSchema: z.object({ path: z.string() }),
   execute: async ({ path: rel }) => {
     const full = safePath(rel, 'read');
@@ -453,7 +447,7 @@ const readCampaignFile = tool({
 
 const writeCampaignFile = tool({
   name: 'writeCampaignFile',
-  description: 'Write or update a campaign file (e.g. a notes/learnings file). Never overwrite tracker.json or applicant.json; use the record_* tools for those.',
+  description: 'Write a text file in the campaign workspace or repo workspace. State files and secrets are protected from direct writes.',
   inputSchema: z.object({ path: z.string(), content: z.string() }),
   execute: async ({ path: rel, content }) => {
     const full = safePath(rel, 'write');
@@ -466,7 +460,7 @@ const writeCampaignFile = tool({
 
 const browserNavigate = tool({
   name: 'browser_navigate',
-  description: 'Navigate to a URL, reusing an already-open matching portal tab when one exists.',
+  description: 'Navigate the controlled browser page to a URL, reusing an already-open matching portal tab when one exists.',
   inputSchema: z.object({ url: z.string() }),
   execute: async ({ url }) => {
     if (!page) return { error: 'browser not connected' };
@@ -485,7 +479,7 @@ const browserNavigate = tool({
 
 const browserSnapshot = tool({
   name: 'browser_snapshot',
-  description: 'Return a trimmed accessibility snapshot of the current page to read text and locate form fields.',
+  description: 'Return a trimmed accessibility snapshot of the current browser page.',
   inputSchema: z.object({}),
   execute: async () => {
     if (!page) return { error: 'browser not connected' };
@@ -497,7 +491,7 @@ const browserSnapshot = tool({
 
 const browserEvaluate = tool({
   name: 'browser_evaluate',
-  description: 'Run a JS expression in the page and return a JSON string of the result. Use to extract data or inspect the DOM.',
+  description: 'Run a JavaScript expression in the current browser page and return the JSON-serialized result.',
   inputSchema: z.object({ expression: z.string() }),
   execute: async ({ expression }) => {
     if (!page) return { error: 'browser not connected' };
@@ -511,7 +505,7 @@ const browserEvaluate = tool({
 
 const browserClick = tool({
   name: 'browser_click',
-  description: 'Click an element by CSS selector.',
+  description: 'Click an element in the current browser page by CSS selector.',
   inputSchema: z.object({ selector: z.string() }),
   execute: async ({ selector }) => {
     if (!page) return { error: 'browser not connected' };
@@ -522,7 +516,7 @@ const browserClick = tool({
 
 const browserFill = tool({
   name: 'browser_fill',
-  description: 'Fill an input by CSS selector with a value.',
+  description: 'Fill an input in the current browser page by CSS selector.',
   inputSchema: z.object({ selector: z.string(), value: z.string() }),
   execute: async ({ selector, value }) => {
     if (!page) return { error: 'browser not connected' };
@@ -533,7 +527,7 @@ const browserFill = tool({
 
 const browserUpload = tool({
   name: 'browser_upload',
-  description: 'Upload a file to a file input by CSS selector (used for the CV).',
+  description: 'Upload a local file to a file input in the current browser page by CSS selector.',
   inputSchema: z.object({ selector: z.string(), filePath: z.string() }),
   execute: async ({ selector, filePath }) => {
     if (!page) return { error: 'browser not connected' };
@@ -578,53 +572,30 @@ const searchPortal = tool({
 
 const scoreCandidate = tool({
   name: 'score_candidate',
-  description: 'CV-alignment gate. Pass a candidate {roleTitle, description, region, remotePolicy, salarySeen}. Returns {decision: apply|skip, reason}.',
+  description: 'Record the model-directed fit decision for a candidate. The tool does not score with hidden rules; provide decision and reason from the prompt policy.',
   inputSchema: z.object({
     roleTitle: z.string(),
     description: z.string().optional().default(''),
     region: z.enum(['il', 'eu', 'global']).optional().default('il'),
     remotePolicy: z.string().optional().default(''),
     salarySeen: z.string().optional().default(''),
+    decision: z.enum(['apply', 'skip']),
+    reason: z.string(),
   }),
-  execute: async ({ roleTitle, description, region, remotePolicy, salarySeen }) => {
-    const text = (roleTitle + ' ' + description).toLowerCase();
-    let decision;
-    if (SKIP_ROLE.test(text)) {
-      decision = { decision: 'skip', reason: 'excluded role/level' };
-    } else if (!ALLOW_ROLE.test(text)) {
-      decision = { decision: 'skip', reason: 'no matching stack' };
-    } else if (region === 'eu' || region === 'global') {
-      if (!/remote/i.test(remotePolicy) && !/remote/i.test(text)) {
-        decision = { decision: 'skip', reason: 'EU must be full remote' };
-      } else {
-        const m = salarySeen && salarySeen.match(/(\d[\d,]*)\s*(pln|zł|zl)/i);
-        if (m) {
-          const num = Number(m[1].replace(/,/g, ''));
-          if (num > 0 && num < 15000) {
-            decision = { decision: 'skip', reason: 'EU B2B below 15k PLN' };
-          } else {
-            decision = { decision: 'apply', reason: 'matches stack and policy' };
-          }
-        } else {
-          decision = { decision: 'apply', reason: 'matches stack and policy' };
-        }
-      }
-    } else {
-      decision = { decision: 'apply', reason: 'matches stack and policy' };
-    }
+  execute: async ({ roleTitle, description, region, remotePolicy, salarySeen, decision, reason }) => {
     updateWorkflow({
-      step: decision.decision === 'apply' ? 'scoring' : 'skipped',
-      pendingStep: decision.decision === 'apply' ? 'prepare application' : 'record skip',
-      currentCandidate: { roleTitle, region },
-      lastOutcome: decision.decision,
+      step: decision === 'apply' ? 'scoring' : 'skipped',
+      pendingStep: decision === 'apply' ? 'prepare application' : 'record skip',
+      currentCandidate: { roleTitle, region, remotePolicy, salarySeen },
+      lastOutcome: decision,
     });
-    return decision;
+    return { decision, reason, candidate: { roleTitle, description, region, remotePolicy, salarySeen } };
   },
 });
 
 const dedupe = tool({
   name: 'dedupe',
-  description: 'Check a candidate against tracker.json (one company once) by companyKey, id, and url. Returns {duplicate, matchedBy, companyKey, gmailUrl}.',
+  description: 'Lookup whether a candidate is already present in tracker.json by company, id, or normalized URL. Returns duplicate metadata.',
   inputSchema: z.object({
     company: z.string(),
     roleTitle: z.string().optional().default(''),
@@ -660,7 +631,7 @@ const dedupe = tool({
 
 const recordSubmission = tool({
   name: 'record_submission',
-  description: 'Record a VERIFIED submission to tracker.json and increment the submitted counter. Only call after confirming success IN the browser. DRY_RUN makes this a log-only no-op.',
+  description: 'Append a submitted application record to tracker.json and update progress. DRY_RUN makes this a log-only no-op.',
   inputSchema: z.object({
     company: z.string(),
     roleTitle: z.string(),
@@ -714,7 +685,7 @@ const recordSubmission = tool({
 
 const recordSkip = tool({
   name: 'record_skip',
-  description: 'Record a skipped candidate (duplicate/salary/filter) into tracker.json stats. DRY_RUN logs only.',
+  description: 'Append a skipped candidate record to tracker.json. DRY_RUN logs only.',
   inputSchema: z.object({
     company: z.string(),
     reason: z.enum(['skippedDuplicate', 'skippedSalary', 'skippedFilter']),
@@ -749,7 +720,7 @@ const getStatus = tool({
 
 const vectorWriteTool = tool({
   name: 'vectorWriteTool',
-  description: 'Embed and store a text chunk (a lesson learned, a portal quirk, campaign notes) into the local vector DB for later retrieval as augmented context.',
+  description: 'Upsert a text chunk into the local vector DB for later retrieval.',
   inputSchema: z.object({ key: z.string(), text: z.string() }),
   execute: async ({ key, text }) => {
     await ensureVec();
@@ -760,7 +731,7 @@ const vectorWriteTool = tool({
 
 const vectorSearchTool = tool({
   name: 'vectorSearchTool',
-  description: 'Retrieve the most relevant stored context chunks for a query (past learnings about a portal or role). Returns texts.',
+  description: 'Search the local vector DB for text chunks relevant to a query.',
   inputSchema: z.object({ query: z.string(), limit: z.number().optional().default(5) }),
   execute: async ({ query, limit }) => {
     await ensureVec();
@@ -811,7 +782,7 @@ Each cycle you MUST:
 2. Do not analyze tracker.json at length. It is compacted for you and dedupe performs exact checks.
 3. Immediately call search_portal after startup context. Prefer the configured portal list and region "il" unless you have a concrete reason to switch. Google discovery results, other reputable portals, and company career pages are valid sources too when they lead to real listings.
 4. search_portal only opens/foregrounds a source. You must use browser_snapshot and browser_evaluate to understand the live page, distinguish real job listings from navigation/category/account links, and extract each candidate yourself.
-5. For each real candidate you discover: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
+5. For each real candidate you discover: decide fit yourself using the prompt rules, then call score_candidate with decision "apply" or "skip" and a concrete reason. score_candidate records your decision; it does not contain hidden screening logic.
 6. If all checks are green: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). For IL/Petah Tikva roles, upload the current Petah Tikva CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
 7. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
 8. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
@@ -821,6 +792,9 @@ Rules:
 - One company once (dedupe). Skip ABAP, Salesforce, pure QA, C/C++, .NET, mobile, ML/data, DevOps-only, team-lead/lead/architect/manager.
 - IL: remote, hybrid, or onsite all OK. EU/global: full remote only, B2B >= 15000 PLN/month when salary is listed.
 - Jobs may come from the configured portals, Google search results, another job board, or a company career page. Apply the same score, dedupe, browser verification, and record gates for every source.
+- After score_candidate returns "apply", build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe before any application attempt.
+- dedupe is a tracker lookup, not a scorer. If duplicate is true, call record_skip with skippedDuplicate.
+- record_submission is the only way to write verified submissions to tracker.json. writeCampaignFile is for notes/context files, not tracker state.
 - Never rely on search_portal output as a candidate list. Treat it as a page opener only; candidate discovery is your browser reasoning job.
 - Reuse already-open portal tabs. Do not open duplicate tabs for the same site.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
