@@ -282,17 +282,22 @@ function embed(text) {
 // ---------------------------------------------------------------------------
 let browser = null;
 let page = null;
+let lastControlledPortalHost = null;
 async function ensureBrowser() {
-  if (browser) return;
+  if (browser && page && !page.isClosed()) {
+    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+    return;
+  }
   if (NO_BROWSER) {
     log('browser disabled by JOBLOOPER_NO_BROWSER; skipping CDP connection');
     return;
   }
   try {
-    browser = await chromium.connectOverCDP(CDP_URL);
+    if (!browser) browser = await chromium.connectOverCDP(CDP_URL);
     const ctx = browser.contexts()[0] || (await browser.newContext());
-    page = ctx.pages()[0] || (await ctx.newPage());
+    page = orderedPagesForReuse(ctx)[0] || (await ctx.newPage());
     await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+    lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
     log('browser connected via CDP', CDP_URL, 'controlledUrl=', page.url());
   } catch (e) {
     browser = null;
@@ -340,6 +345,49 @@ const PORTALS = {
     { name: 'Pracuj', url: 'https://www.pracuj.pl/praca/java%20developer' },
   ],
 };
+const PORTAL_REUSE_HOSTS = new Set(Object.values(PORTALS).flat().map((portal) => {
+  try {
+    return new URL(portal.url).host;
+  } catch {
+    return '';
+  }
+}).filter(Boolean));
+const RATE_LIMIT_BACKOFF_MS = [15000, 30000, 60000, 120000, 240000];
+
+function urlHost(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return '';
+  }
+}
+
+function samePortalTarget(pageUrl, targetUrl) {
+  const pageHost = urlHost(pageUrl);
+  const targetHost = urlHost(targetUrl);
+  if (!pageHost || !targetHost) return false;
+  if (pageUrl === targetUrl) return true;
+  return pageHost === targetHost && PORTAL_REUSE_HOSTS.has(targetHost);
+}
+
+function orderedPagesForReuse(ctx) {
+  const pages = ctx.pages().filter((candidate) => !candidate.isClosed());
+  return pages.sort((a, b) => {
+    const aHost = urlHost(a.url());
+    const bHost = urlHost(b.url());
+    const score = (host, candidate) => {
+      if (candidate === page) return 0;
+      if (host && host === lastControlledPortalHost) return 1;
+      if (PORTAL_REUSE_HOSTS.has(host)) return 2;
+      return 3;
+    };
+    return score(aHost, a) - score(bHost, b);
+  });
+}
+
+async function findExistingPortalPage(ctx, targetUrl) {
+  return orderedPagesForReuse(ctx).find((candidate) => samePortalTarget(candidate.url(), targetUrl)) || null;
+}
 
 // ---------------------------------------------------------------------------
 // CV-alignment policy (kept in sync with the campaign rules)
@@ -387,14 +435,23 @@ const writeCampaignFile = tool({
 
 const browserNavigate = tool({
   name: 'browser_navigate',
-  description: 'Navigate the single working browser tab to a URL.',
+  description: 'Navigate to a URL, reusing an already-open matching portal tab when one exists.',
   inputSchema: z.object({ url: z.string() }),
   execute: async ({ url }) => {
     if (!page) return { error: 'browser not connected' };
     updateWorkflow({ step: 'browsing', pendingStep: 'inspect listing', currentUrl: url, lastOutcome: 'navigated' });
+    const existing = await findExistingPortalPage(page.context(), url);
+    if (existing) {
+      page = existing;
+      await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+      lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
+      log('browser reused existing portal tab', { url: page.url(), target: url });
+      return { ok: true, reused: true, url: page.url() };
+    }
     await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+    lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
     return { ok: true, url: page.url() };
   },
 });
@@ -464,9 +521,17 @@ async function openNextPortal(region) {
   const portal = list[state.cycles % list.length];
   state.cycles++;
   updateWorkflow({ step: 'searching', currentRegion: region, currentPortal: portal.name, pendingStep: 'review candidates', lastOutcome: 'opened portal' });
+  const existing = await findExistingPortalPage(page.context(), portal.url);
+  if (existing) {
+    page = existing;
+    log('portal tab reused', { portal: portal.name, url: page.url(), target: portal.url });
+  }
   await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-  await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  if (!existing) {
+    await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  }
   await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+  lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
   await page.waitForTimeout(2500);
   const items = await page.$$eval('a[href]', (as) => {
       const out = [];
@@ -483,7 +548,7 @@ async function openNextPortal(region) {
       }
       return out;
   });
-  return { portal: portal.name, region, count: items.length, candidates: items, url: page.url() };
+  return { portal: portal.name, region, count: items.length, candidates: items, url: page.url(), reused: Boolean(existing) };
 }
 
 const searchPortal = tool({
@@ -724,19 +789,19 @@ const TOOLS = [
 const SYSTEM = `You are JobLooper, a headless worker that applies to jobs until the submitted count reaches the target (${TARGET}).
 
 Each cycle you MUST:
-1. Load context: call get_status, readCampaignFile for tracker.json and applicant.json, and vectorSearchTool for relevant past learnings.
+1. Load context: call get_status, readCampaignFile for tracker.json and applicant.json, and vectorSearchTool for relevant past learnings/campaign context.
 2. Do not analyze tracker.json at length. It is compacted for you and dedupe performs exact checks.
-3. Immediately call search_portal after startup context. Prefer region "il" unless you have a concrete reason to switch.
+3. Immediately call search_portal after startup context. Prefer the configured portal list and region "il" unless you have a concrete reason to switch.
 4. For each candidate: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
-5. If not a duplicate: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). Upload the CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
+5. If all checks are green: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). For IL/Petah Tikva roles, upload the current Petah Tikva CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
 6. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
 7. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
-8. Persist anything useful with vectorWriteTool (portal quirks, form selectors that worked, lessons).
+8. Update progress and persist anything useful with vectorWriteTool/writeCampaignFile (portal quirks, form selectors that worked, lessons, compressed campaign context) before the next loop.
 
 Rules:
 - One company once (dedupe). Skip ABAP, Salesforce, pure QA, C/C++, .NET, mobile, ML/data, DevOps-only, team-lead/lead/architect/manager.
 - IL: remote, hybrid, or onsite all OK. EU/global: full remote only, B2B >= 15000 PLN/month when salary is listed.
-- Use only the single browser tab; navigate on it. Do not open extra tabs.
+- Reuse already-open portal tabs. Do not open duplicate tabs for the same site.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
 - Keep applying until get_status shows submitted >= target.
 - Use only the exact tool names provided to you. Do not invent tools such as forget_status or any other typo. Start every turn with get_status with an empty object.`;
@@ -757,6 +822,10 @@ function stopWhen({ steps }) {
 function isTransientModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
   return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable/i.test(message);
+}
+function isRateLimitModelError(error) {
+  const message = (error && (error.message || error.toString())) || '';
+  return /rate limit|429|throttl|too many requests|free-models-per-day|quota/i.test(message);
 }
 function isBrowserConnectionError(error) {
   const message = (error && (error.message || error.toString())) || '';
@@ -840,7 +909,7 @@ async function recoverMalformedToolCalls(toolCalls) {
 }
 
 async function runTurnWithRetry() {
-  const maxAttempts = 5;
+  const maxAttempts = 8;
   let delayMs = 2000;
   let lastError = null;
 
@@ -853,9 +922,11 @@ async function runTurnWithRetry() {
       if (!isTransientModelError(e) || attempt >= maxAttempts) {
         throw e;
       }
-      log(`model turn attempt ${attempt}/${maxAttempts} failed, retrying in ${delayMs}ms`, e.message);
-      await sleep(delayMs);
-      delayMs = Math.min(delayMs * 2, 30000);
+      const rateLimited = isRateLimitModelError(e);
+      const waitMs = rateLimited ? RATE_LIMIT_BACKOFF_MS[Math.min(attempt - 1, RATE_LIMIT_BACKOFF_MS.length - 1)] : delayMs;
+      log(`model turn attempt ${attempt}/${maxAttempts} failed, retrying in ${waitMs}ms`, e.message);
+      await sleep(waitMs);
+      delayMs = rateLimited ? waitMs : Math.min(delayMs * 2, 30000);
     }
   }
 
@@ -914,7 +985,9 @@ async function main() {
         browser = null;
         page = null;
       }
-      const backoff = Math.min(30000, 5000 * Math.pow(2, Math.min(state.errors, 4)));
+      const backoff = isRateLimitModelError(e)
+        ? RATE_LIMIT_BACKOFF_MS[Math.min(state.errors - 1, RATE_LIMIT_BACKOFF_MS.length - 1)]
+        : Math.min(30000, 5000 * Math.pow(2, Math.min(state.errors, 4)));
       await sleep(backoff);
       continue;
     }
