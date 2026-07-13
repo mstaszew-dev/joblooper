@@ -420,27 +420,6 @@ async function navigateControlledPage(url, { waitMs = 0 } = {}) {
   return { from, url: finalUrl, navigated, urlMismatch: !isSameUrl(finalUrl, url) };
 }
 
-const CANDIDATE_TITLE_RE = /(java|kotlin|spring|php|laravel|symfony|node|nest|react|angular|backend|back.?end|full.?stack|fullstack|developer|engineer|software|תוכנה|פיתוח|מפתח|מפתחת|מתכנת|מתכנתת|בקאנד|פולסטאק|ג'אווה)/i;
-const JOB_URL_RE = /(job|jobs|career|careers|position|vacancy|praca|oferta|משרה|דרוש|jobid|positionid|reqid)/i;
-const NAV_TITLE_RE = /(all categories|companies|contact|career magazine|smart alert|saved jobs|post a job|login|sign in|profile|resume|cv|כל\s+הקטגוריות|חברות|צור\s+קשר|מגזין|הסוכנת|משרות\s+שאהבתי|פרסום\s+משרה|קורות\s+חיים|איזור\s+אישי)/i;
-const NAV_PATH_RE = /(\/$|#|login|signin|personal|myboard|categories|companies|articles|contactus|smartalerts|myjobs|employers|resume|cv|korot|קורות|חברות|מאמרים|צור-קשר)/i;
-
-function isLikelyCandidateLink(link) {
-  const title = String(link.title || '').trim();
-  if (title.length < 3 || NAV_TITLE_RE.test(title)) return false;
-  let url;
-  try {
-    url = new URL(link.url);
-  } catch {
-    return false;
-  }
-  const path = decodeURIComponent(url.pathname || '');
-  const href = decodeURIComponent(url.href || '');
-  if (/\/jobs\/cat\d+\/?$/i.test(path)) return false;
-  if (NAV_PATH_RE.test(path) && !CANDIDATE_TITLE_RE.test(title)) return false;
-  return CANDIDATE_TITLE_RE.test(title) || JOB_URL_RE.test(href);
-}
-
 // ---------------------------------------------------------------------------
 // CV-alignment policy (kept in sync with the campaign rules)
 // ---------------------------------------------------------------------------
@@ -579,27 +558,20 @@ async function openNextPortal(region) {
   } else {
     log('portal opened', { portal: portal.name, from: nav.from, url: nav.url, target: portal.url, navigated: nav.navigated, urlMismatch: nav.urlMismatch });
   }
-  const rawLinks = await page.$$eval('a[href]', (as) => as.map((a) => ({
-    url: a.href || '',
-    title: (a.innerText || a.textContent || '').trim().slice(0, 160),
-  })).filter((link) => link.url && link.title));
-  const seen = new Set();
-  const items = [];
-  for (const link of rawLinks) {
-    if (seen.has(link.url) || !isLikelyCandidateLink(link)) continue;
-    seen.add(link.url);
-    items.push({ url: link.url, title: link.title.slice(0, 120) });
-    if (items.length >= 12) break;
-  }
-  if (!items.length && rawLinks.length) {
-    log('portal extraction found no likely job links after filtering', { portal: portal.name, rawCount: rawLinks.length, url: page.url() });
-  }
-  return { portal: portal.name, region, count: items.length, rawCount: rawLinks.length, candidates: items, url: page.url(), reused: Boolean(existing) };
+  return {
+    portal: portal.name,
+    region,
+    url: page.url(),
+    reused: Boolean(existing),
+    navigated: nav.navigated,
+    urlMismatch: nav.urlMismatch,
+    instruction: 'Use browser_snapshot and browser_evaluate to inspect this live page, identify real job listings, then score and dedupe each candidate. Do not treat this tool result as a candidate list.',
+  };
 }
 
 const searchPortal = tool({
   name: 'search_portal',
-  description: 'Open the next job board for a region (il|eu) and extract listing links (title, company, url). Returns candidate stubs to score and apply to.',
+  description: 'Open the next preferred source for a region (il|eu). This only navigates/foregrounds a source; inspect the live page with browser_snapshot/browser_evaluate to discover real listings.',
   inputSchema: z.object({ region: z.enum(['il', 'eu']) }),
   execute: async ({ region }) => openNextPortal(region),
 });
@@ -838,16 +810,18 @@ Each cycle you MUST:
 1. Load context: call get_status, readCampaignFile for tracker.json and applicant.json, and vectorSearchTool for relevant past learnings/campaign context.
 2. Do not analyze tracker.json at length. It is compacted for you and dedupe performs exact checks.
 3. Immediately call search_portal after startup context. Prefer the configured portal list and region "il" unless you have a concrete reason to switch. Google discovery results, other reputable portals, and company career pages are valid sources too when they lead to real listings.
-4. For each candidate: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
-5. If all checks are green: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). For IL/Petah Tikva roles, upload the current Petah Tikva CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
-6. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
-7. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
-8. Update progress and persist anything useful with vectorWriteTool/writeCampaignFile (portal quirks, form selectors that worked, lessons, compressed campaign context) before the next loop.
+4. search_portal only opens/foregrounds a source. You must use browser_snapshot and browser_evaluate to understand the live page, distinguish real job listings from navigation/category/account links, and extract each candidate yourself.
+5. For each real candidate you discover: call score_candidate. If apply, build a full candidate object (company, roleTitle, region, remotePolicy, salarySeen, source, sourceJobId, url) and call dedupe.
+6. If all checks are green: browser_navigate to the listing, find the apply path, fill the form using applicant.json fields (phone: IL +972559344507 / EU +48790775407; salary 15000 PLN EU or 15000 ILS IL; LinkedIn in the LinkedIn field; GitHub https://github.com/mstaszew-dev when a GitHub field exists; coverNote or coverNotePl for motivation; for PL/EU roles include plB2bNote). For IL/Petah Tikva roles, upload the current Petah Tikva CV file at /Users/mst/Downloads/job-search/cv/michael-staszewski-cv.pdf when a file field exists.
+7. Verify success IN the browser with browser_snapshot (a thank-you URL or confirmation text). NEVER record without this.
+8. Call record_submission only after verification. Call record_skip for duplicates/salary/filter.
+9. Update progress and persist anything useful with vectorWriteTool/writeCampaignFile (portal quirks, form selectors that worked, lessons, compressed campaign context) before the next loop.
 
 Rules:
 - One company once (dedupe). Skip ABAP, Salesforce, pure QA, C/C++, .NET, mobile, ML/data, DevOps-only, team-lead/lead/architect/manager.
 - IL: remote, hybrid, or onsite all OK. EU/global: full remote only, B2B >= 15000 PLN/month when salary is listed.
 - Jobs may come from the configured portals, Google search results, another job board, or a company career page. Apply the same score, dedupe, browser verification, and record gates for every source.
+- Never rely on search_portal output as a candidate list. Treat it as a page opener only; candidate discovery is your browser reasoning job.
 - Reuse already-open portal tabs. Do not open duplicate tabs for the same site.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
 - Keep applying until get_status shows submitted >= target.
