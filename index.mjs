@@ -372,6 +372,20 @@ function samePortalTarget(pageUrl, targetUrl) {
   return pageHost === targetHost && PORTAL_REUSE_HOSTS.has(targetHost);
 }
 
+function comparableUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.href.replace(/\/$/, '');
+  } catch {
+    return String(value || '').replace(/\/$/, '');
+  }
+}
+
+function isSameUrl(a, b) {
+  return comparableUrl(a) === comparableUrl(b);
+}
+
 function orderedPagesForReuse(ctx) {
   const pages = ctx.pages().filter((candidate) => !candidate.isClosed());
   return pages.sort((a, b) => {
@@ -389,6 +403,42 @@ function orderedPagesForReuse(ctx) {
 
 async function findExistingPortalPage(ctx, targetUrl) {
   return orderedPagesForReuse(ctx).find((candidate) => samePortalTarget(candidate.url(), targetUrl)) || null;
+}
+
+async function navigateControlledPage(url, { waitMs = 0 } = {}) {
+  const from = page.url();
+  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+  let navigated = false;
+  if (!isSameUrl(from, url)) {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    navigated = true;
+  }
+  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
+  lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
+  if (waitMs) await page.waitForTimeout(waitMs);
+  const finalUrl = page.url();
+  return { from, url: finalUrl, navigated, urlMismatch: !isSameUrl(finalUrl, url) };
+}
+
+const CANDIDATE_TITLE_RE = /(java|kotlin|spring|php|laravel|symfony|node|nest|react|angular|backend|back.?end|full.?stack|fullstack|developer|engineer|software|תוכנה|פיתוח|מפתח|מפתחת|מתכנת|מתכנתת|בקאנד|פולסטאק|ג'אווה)/i;
+const JOB_URL_RE = /(job|jobs|career|careers|position|vacancy|praca|oferta|משרה|דרוש|jobid|positionid|reqid)/i;
+const NAV_TITLE_RE = /(all categories|companies|contact|career magazine|smart alert|saved jobs|post a job|login|sign in|profile|resume|cv|כל\s+הקטגוריות|חברות|צור\s+קשר|מגזין|הסוכנת|משרות\s+שאהבתי|פרסום\s+משרה|קורות\s+חיים|איזור\s+אישי)/i;
+const NAV_PATH_RE = /(\/$|#|login|signin|personal|myboard|categories|companies|articles|contactus|smartalerts|myjobs|employers|resume|cv|korot|קורות|חברות|מאמרים|צור-קשר)/i;
+
+function isLikelyCandidateLink(link) {
+  const title = String(link.title || '').trim();
+  if (title.length < 3 || NAV_TITLE_RE.test(title)) return false;
+  let url;
+  try {
+    url = new URL(link.url);
+  } catch {
+    return false;
+  }
+  const path = decodeURIComponent(url.pathname || '');
+  const href = decodeURIComponent(url.href || '');
+  if (NAV_PATH_RE.test(path) && !CANDIDATE_TITLE_RE.test(title)) return false;
+  if (/\/jobs\/cat\d+/i.test(path) && !CANDIDATE_TITLE_RE.test(title)) return false;
+  return CANDIDATE_TITLE_RE.test(title) || JOB_URL_RE.test(href);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,16 +495,12 @@ const browserNavigate = tool({
     const existing = await findExistingPortalPage(page.context(), url);
     if (existing) {
       page = existing;
-      await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-      lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
-      log('browser reused existing portal tab', { url: page.url(), target: url });
-      return { ok: true, reused: true, url: page.url() };
+      const nav = await navigateControlledPage(url);
+      log('browser reused existing portal tab', { from: nav.from, url: nav.url, target: url, navigated: nav.navigated, urlMismatch: nav.urlMismatch });
+      return { ok: true, reused: true, navigated: nav.navigated, urlMismatch: nav.urlMismatch, url: nav.url };
     }
-    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-    lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
-    return { ok: true, url: page.url() };
+    const nav = await navigateControlledPage(url);
+    return { ok: true, navigated: nav.navigated, urlMismatch: nav.urlMismatch, url: nav.url };
   },
 });
 
@@ -526,31 +572,29 @@ async function openNextPortal(region) {
   const existing = await findExistingPortalPage(page.context(), portal.url);
   if (existing) {
     page = existing;
-    log('portal tab reused', { portal: portal.name, url: page.url(), target: portal.url });
   }
-  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-  if (!existing) {
-    await page.goto(portal.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const nav = await navigateControlledPage(portal.url, { waitMs: 2500 });
+  if (existing) {
+    log('portal tab reused', { portal: portal.name, from: nav.from, url: nav.url, target: portal.url, navigated: nav.navigated, urlMismatch: nav.urlMismatch });
+  } else {
+    log('portal opened', { portal: portal.name, from: nav.from, url: nav.url, target: portal.url, navigated: nav.navigated, urlMismatch: nav.urlMismatch });
   }
-  await page.bringToFront().catch((e) => debugLog('bringToFront failed', e.message));
-  lastControlledPortalHost = urlHost(page.url()) || lastControlledPortalHost;
-  await page.waitForTimeout(2500);
-  const items = await page.$$eval('a[href]', (as) => {
-      const out = [];
-      const seen = new Set();
-      for (const a of as) {
-        const href = a.href || '';
-        const text = (a.innerText || a.textContent || '').trim();
-        if (!text || text.length < 3) continue;
-        if (!/job|career|praca|oferta|mit?|drushim|alljobs|jobmaster/i.test(href) && !/java|php|node|react|developer|engineer|full.?stack/i.test(text)) continue;
-        if (seen.has(href)) continue;
-        seen.add(href);
-        if (out.length >= 12) break;
-        out.push({ url: href, title: text.slice(0, 120) });
-      }
-      return out;
-  });
-  return { portal: portal.name, region, count: items.length, candidates: items, url: page.url(), reused: Boolean(existing) };
+  const rawLinks = await page.$$eval('a[href]', (as) => as.map((a) => ({
+    url: a.href || '',
+    title: (a.innerText || a.textContent || '').trim().slice(0, 160),
+  })).filter((link) => link.url && link.title));
+  const seen = new Set();
+  const items = [];
+  for (const link of rawLinks) {
+    if (seen.has(link.url) || !isLikelyCandidateLink(link)) continue;
+    seen.add(link.url);
+    items.push({ url: link.url, title: link.title.slice(0, 120) });
+    if (items.length >= 12) break;
+  }
+  if (!items.length && rawLinks.length) {
+    log('portal extraction found no likely job links after filtering', { portal: portal.name, rawCount: rawLinks.length, url: page.url() });
+  }
+  return { portal: portal.name, region, count: items.length, rawCount: rawLinks.length, candidates: items, url: page.url(), reused: Boolean(existing) };
 }
 
 const searchPortal = tool({
@@ -856,18 +900,8 @@ async function debugModelTurn(result) {
   const toolCallSummaries = [];
   try {
     for await (const event of result.getFullResponsesStream()) {
-      const summary = event && typeof event === 'object'
-        ? {
-            type: event.type,
-            itemType: event.item?.type,
-            name: event.name || event.item?.name,
-            toolCallId: event.call_id || event.toolCallId,
-            status: event.status,
-            responseId: event.response?.id,
-            delta: typeof event.delta === 'string' ? event.delta.slice(0, 200) : undefined,
-          }
-        : String(event);
-      debugLog('model event', summary);
+      const summary = summarizeModelEvent(event);
+      if (summary) debugLog('model event', summary);
     }
   } catch (e) {
     debugLog('model event stream failed', e.message);
@@ -900,6 +934,20 @@ async function debugModelTurn(result) {
     dryApplied: state.dryApplied,
   });
   return { text, toolCalls };
+}
+
+function summarizeModelEvent(event) {
+  if (!event || typeof event !== 'object') return String(event);
+  if (event.type && /\.delta$/.test(event.type)) return null;
+  if (event.type === 'response.content_part.added' || event.type === 'response.content_part.done') return null;
+  return {
+    type: event.type,
+    itemType: event.item?.type,
+    name: event.name || event.item?.name,
+    toolCallId: event.call_id || event.toolCallId,
+    status: event.status,
+    responseId: event.response?.id,
+  };
 }
 
 async function recoverMalformedToolCalls(toolCalls) {
