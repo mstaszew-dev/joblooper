@@ -436,8 +436,8 @@ function isLikelyCandidateLink(link) {
   }
   const path = decodeURIComponent(url.pathname || '');
   const href = decodeURIComponent(url.href || '');
+  if (/\/jobs\/cat\d+\/?$/i.test(path)) return false;
   if (NAV_PATH_RE.test(path) && !CANDIDATE_TITLE_RE.test(title)) return false;
-  if (/\/jobs\/cat\d+/i.test(path) && !CANDIDATE_TITLE_RE.test(title)) return false;
   return CANDIDATE_TITLE_RE.test(title) || JOB_URL_RE.test(href);
 }
 
@@ -868,7 +868,7 @@ function stopWhen({ steps }) {
 
 function isTransientModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
-  return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable/i.test(message);
+  return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable|response failed/i.test(message);
 }
 function isRateLimitModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
