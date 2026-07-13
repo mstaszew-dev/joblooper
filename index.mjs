@@ -334,7 +334,7 @@ function waitForEnter(msg) {
 // ---------------------------------------------------------------------------
 const PORTALS = {
   il: [
-    { name: 'Drushim', url: 'https://www.drushim.co.il/%D7%9E%D7%A4%D7%A8%D7%90%D7%99%D7%9D-%D7%A4%D7%99%D7%AA%D7%95%D7%97-%D7%A8%D7%A7%D7%A2/' },
+    { name: 'Drushim', url: 'https://www.drushim.co.il/jobs/cat6/' },
     { name: 'JobNet', url: 'https://www.jobnet.co.il/jobs?q=java' },
     { name: 'JobMaster', url: 'https://www.jobmaster.co.il/' },
     { name: 'AllJobs', url: 'https://www.alljobs.co.il/User/JobsFeed/' },
@@ -906,7 +906,10 @@ async function recoverMalformedToolCalls(toolCalls) {
     const opened = await openNextPortal(region);
     log('[tool-recovery] opened portal for malformed tool call', malformedSearch.name, opened);
   }
-  const malformed = toolCalls.find((call) => /<\|.*\|>|<[^>]+>|json$/i.test(String(call.name || '')) && !String(call.name || '').match(/^search_portal$/));
+  const malformed = toolCalls.find((call) => {
+    const name = String(call.name || '');
+    return /<\|.*\|>|<[^>]+>|json$/i.test(name) && !name.includes('search_portal');
+  });
   if (malformed) {
     throw new Error(`Malformed tool name emitted by model: ${malformed.name}`);
   }
