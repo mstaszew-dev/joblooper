@@ -825,7 +825,7 @@ Rules:
 - Reuse already-open portal tabs. Do not open duplicate tabs for the same site.
 - You must call a tool on every turn. Do not end a turn with only text before the target is reached.
 - Keep applying until get_status shows submitted >= target.
-- Use only the exact tool names provided to you. Do not invent tools such as forget_status or any other typo. Start every turn with get_status with an empty object.`;
+- Use only the exact tool names provided to you. Tool names are plain names like readCampaignFile and browser_snapshot; never include channel markers, angle-bracket tags, JSON suffixes, or any other decoration. Start every turn with get_status with an empty object.`;
 
 // ---------------------------------------------------------------------------
 // Agent loop
@@ -842,7 +842,7 @@ function stopWhen({ steps }) {
 
 function isTransientModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
-  return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable|response failed/i.test(message);
+  return /rate limit|429|timeout|timed out|network|fetch failed|econn|temporarily unavailable|overloaded|too many requests|service unavailable|response failed|malformed tool/i.test(message);
 }
 function isRateLimitModelError(error) {
   const message = (error && (error.message || error.toString())) || '';
@@ -926,11 +926,16 @@ function summarizeModelEvent(event) {
 
 async function recoverMalformedToolCalls(toolCalls) {
   const malformedSearch = toolCalls.find((call) => call.name && call.name !== 'search_portal' && String(call.name).includes('search_portal'));
-  if (!malformedSearch) return;
-  if (!page && !NO_BROWSER) await ensureBrowser();
-  const region = malformedSearch.arguments?.region === 'eu' ? 'eu' : 'il';
-  const opened = await openNextPortal(region);
-  log('[tool-recovery] opened portal for malformed tool call', malformedSearch.name, opened);
+  if (malformedSearch) {
+    if (!page && !NO_BROWSER) await ensureBrowser();
+    const region = malformedSearch.arguments?.region === 'eu' ? 'eu' : 'il';
+    const opened = await openNextPortal(region);
+    log('[tool-recovery] opened portal for malformed tool call', malformedSearch.name, opened);
+  }
+  const malformed = toolCalls.find((call) => /<\|.*\|>|<[^>]+>|json$/i.test(String(call.name || '')) && !String(call.name || '').match(/^search_portal$/));
+  if (malformed) {
+    throw new Error(`Malformed tool name emitted by model: ${malformed.name}`);
+  }
 }
 
 async function runTurnWithRetry() {
